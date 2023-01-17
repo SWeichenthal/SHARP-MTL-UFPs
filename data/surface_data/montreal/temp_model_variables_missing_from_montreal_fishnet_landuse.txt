@@ -1,0 +1,6 @@
+Variables in temperature model that are missing from the montreal_fishnet_landuse.csv file:
+
+1. av_traffic_300m, # (we have av_NOx,_100m NOx and traffic are very similar)
+2. residential_300m, # (we have residential_100m)
+3. commercial_300m, # (we have commercial_100m)
+4. roads_300m, # (we have roads_200m)
