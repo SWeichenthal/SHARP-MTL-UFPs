@@ -1,0 +1,1291 @@
+---
+title: "SHARP Exposure Modelling Bootcamp: Day 1, Case Study 1: Predicting Annual UFPs Variations in Montreal, Canada"
+author: "Marshall Lloyd"
+date: "2022-11-19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+In this case study, we will develop a series of models to predict spatial variations in **annual average** **outdoor ultrafine particle (UFP) concentrations** across Montreal, Canada. UFP concentrations were repeatedly measured along roads throughout Montreal during a year-long mobile monitoring campaign. The road network was divided into 100 m long road segments and the median of all UFP measurements along a given road segment was assigned to the centroid of the road segment as the estimate of the annual average. The mean meteorological conditions at the Montreal airport during monitoring were also measured and linked to the aggregated monitoring data. This was done to account for weather-related temporal variations in UFP concentrations (additional details below). Various land use parameters around each road segment were also linked to the database.
+
+**The goal of this project was to use land use information to predict spatial variations in annual average UFP concentrations across Montreal to support future epidemiological investigations.**
+
+**We will develop and examine the following models using the *mlr* and *keras* packages:**
+
+1.  Linear Regression Model (*mlr*)
+2.  Generalized Additive Model (*mlr*)
+3.  Random Forest (*mlr*)
+4.  XGBoost (*mlr*)
+5.  Dense Neural Networks (*keras*)
+
+## Load Packages
+
+Run the following code chunk to load the packages we will need for this exercise.
+
+```{r Load Packages, echo=FALSE}
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(tidyverse,
+               dplyr,
+               mlr,
+               lubridate,
+               # parallel,
+               # parallelMap,
+               mboost,
+               rgdal,
+               cowplot,
+               inlabru,
+               corrplot,
+               ggpolypath,
+               ggspatial,
+               randomForest,
+               xgboost,
+               caTools,
+               reticulate,
+               sf)
+
+
+#memory issues with posit? from here: https://community.rstudio.com/t/solution-for-memory-limit-when-knitting-rmarkdown-in-rstudio-cloud/48372
+# stack_size <- getOption("pandoc.stack.size", default = "512m")
+```
+
+## Load Data
+
+The code below will load the data we will need for this exercise.
+
+The last line provides a list of names of the variables in our database. We will model **ufp_median** (i.e., the annual median UFP concentration), but other variables could also be of interest as outcomes to predict (e.g., BusStops_300m, which is the number of bus stops within 300m). Each row in the data represents a 100 m long road segment.
+
+```{r Load Data, echo=FALSE}
+# read in the UFP monitoring data
+mtl_ufp_dat <- read_csv("data/monitoring_data/montreal_2020_annual_with_land_use_28102022.csv")
+
+# downloading a map of Montreal from a government website
+# create two temporary files so you don't need to think about where you will save and unzip the map
+temp1 <- tempfile()
+temp2 <- tempfile()
+
+# download map to the first temporary file
+download.file(url = "https://www12.statcan.gc.ca/census-recensement/2011/geo/bound-limit/files-fichiers/2016/lada000b16a_e.zip", 
+              destfile = temp1)
+
+# unzip it from the firsrt temporary file and unzip it to the second temporary file
+unzip(zipfile = temp1, exdir = temp2)
+
+# read in the map using the sf package
+mtl_sf <- st_read(temp2) %>%
+  filter(CDUID == 2466) %>% # the file is of all of Canada, based on some googling, we know that the CDUID of Montreal is 2466
+  st_union() %>% #unify all of the parts of Montreal into one object
+  st_transform(., crs = 4326) # transform the coordinates to WGS 84
+
+#List Variable Names in the Temperature Dataset
+names(mtl_ufp_dat)
+```
+
+## Look at Monitoring Data in Montreal
+
+The code below will generate a map to visualize the mobile monitoring routes across Montreal. As you will see, the mobile monitoring campaign covered a lot of area across the entire island of Montreal. It had very good spatial coverage.
+
+```{r Map Mobile Monitoring Routes, echo = FALSE}
+
+ggplot() +
+  geom_sf(data = mtl_sf) +
+  geom_point(data = mtl_ufp_dat, aes(x = point_lon, y = point_lat)) +
+  theme_void()
+ # scale_color_viridis_b() # what does the color scale apply to?
+```
+
+Some roads were visited very few times during the monitoring campaign (e.g. only once). Those roads have poor temporal coverage. If you measured air pollution for 10 seconds on a single day, would that be a reasonable representation of the annual air pollution concentration? The column **days_ufp** in the dataset identifies how many times a particular road segment was monitored. The code below generates several maps that visualize the road segments based on the minimum number of days they were monitored. Notice how we lose spatial coverage as we gain temporal stability (i.e. more days monitoring per road segment). We have to decide where we want to strike this balance. We ended up deciding on minimum 6 days of monitoring per road segment because it preserved our a priori targeted monitoring routes.
+
+```{r Map Number of Visits per Monitoring Route, echo = FALSE}
+
+# create a list of names for the plots
+min_number_of_days <- 
+  seq(from = 0, to = 16, by = 2) %>% 
+  str_pad(., width = 2, pad = 0, side = "left")  # this adds a leading zero so ggplot will arrange the plots in ascending order
+
+data_set_names <- 
+  paste0("Minimum ", min_number_of_days , " days monitoring\n ") # add some text to the plot names
+
+# create multiple datasets that retain the road segments 
+min_days_dat <- 
+  list(0, 2, 4, 6, 8, 10, 12, 14, 16) %>% # a list of the minimum number of days we want to see
+  setNames(., data_set_names) %>% # give names to this list
+  map(., ~filter(mtl_ufp_dat, days_ufp >= .)) %>% # for each item in the list filter the days_ufp in the dataset
+  imap(., ~mutate(.x, data_set = .y)) %>% # create a new column that names each dataset in the list
+  bind_rows() # bind the list of datasets together so you have a single dataset
+
+# check various min days
+ggplot(data = min_days_dat) +
+  geom_sf(data = mtl_sf) +
+  geom_point(aes(x = point_lon, y = point_lat)) +
+  theme_void() +
+  facet_wrap(~data_set) +
+  ggtitle("Number of Monitoring Days Per Route\n")
+
+# notice I added \n to some of the names. At the "\n" ggplot adds a linebreak. I put them there to give a little bit of spacing below the titles. The proper way to do so would be with "theme(plot.title = ....)", but I find using "\n" useful when doing quick exploratory plots because then I don't have to look up exactly how to move titles around.
+
+```
+
+Distributions of air pollution concentrations are often skewed. The code below looks at the distributions of UFP concentrations, Black Carbon concentrations, and mean UFP particle size. The code also displays the log-transformed distributions of UFP and BC concentrations, which we can see results in distributions that are closer to normal. Generally speaking, it is easier to model normally distributed outcomes.
+
+```{r Distribution of UFPs and Black Carbon, echo = FALSE}
+
+mtl_ufp_dat %>%
+  filter(days_ufp >= 6) %>%  # as we decided, we want a minimum of 6 visits per route
+  select(ufp_median, bc_median, size_median) %>%
+  mutate(ufp_median_ln = log(ufp_median), bc_median_ln = log(bc_median)) %>%
+  pivot_longer(., cols = contains("median")) %>%
+  ggplot(data = ., aes(x = value)) +
+  geom_histogram() +
+  theme_bw() +
+  facet_wrap(~name, ncol = 3, scales = "free")
+
+```
+
+## Cleaning the Data
+
+The code chunk below creates a smaller database limited to the outcome we want to predict and the predictor variables we want to consider. Specifically, we will limit the buffer size to 300 meters for our land use variables. We include meteorological conditions in the model as well in order to help control for temporal variations in UFP concentrations. We also generate a log-transformed version of our outcome variable called **ln_ufp** that we will use as our outcome. Finally, we standardize the predictor variables (i.e., so they have a mean = 0 and sd=1). The end result of this code is a new data frame called "**mtl_ufp_dat_clean**".
+
+**With respect to variable names:**
+
+1.  The outcome variable we want to predict is **ln_ufp** (the log of daily mean temperature)
+2.  **lat** and **lon** are latitude and longitude
+3.  **temp**, **hum**, and **ws** are meteorological conditions during monitoring.
+4.  Any variable ending in **\_300m** is a land use variable (e.g., residential area within 300m, length of highways within 300m, etc.)
+5.  Any variable that starts with **Distance** is a "distance to" variable (e.g., distance to airport is d_airport)
+
+```{r}
+
+mtl_ufp_dat_clean <- 
+  mtl_ufp_dat %>% 
+  filter(days_ufp >= 6) %>% # recall, we want a minimum of 6 visits per route 
+  select(lon = point_lon,   # select only the outcome and predictor variables
+         lat = point_lat,
+         ufp_median,
+         temp, hum, ws, # include temperature, humidity, and windspeed 
+         Industrial_300m:Distance_yul) %>%  # select only the 300m buffers
+  mutate(ln_ufp = log(ufp_median)) %>% # log tranform UFP 
+  relocate(ln_ufp, .before = lon) %>%
+  select(-ufp_median, -Distance_airport)
+
+# look for missing values
+map_dbl(mtl_ufp_dat_clean, ~sum(is.na(.))) 
+# notice that there are missing Pop_300m. 
+  # We happen to know that when this data was generated, missing was 0
+
+# standardize the predictors
+mtl_ufp_dat_clean_std <- 
+  mtl_ufp_dat_clean %>%
+  mutate_at(vars(contains("Pop")), ~replace(., is.na(.), 0)) %>%  # impute missing with 0
+  mutate(across(c(!ln_ufp), ~scale(.) %>% as.vector()))  
+
+#Variable Names in Cleaned Data
+names(mtl_ufp_dat_clean_std)
+
+# confirm they are all standardized
+map_dbl(mtl_ufp_dat_clean_std, ~round(mean(.), 5))
+map_dbl(mtl_ufp_dat_clean_std, ~round(sd(.), 5))
+
+```
+
+## Examine Correlations between Predictor Variables
+
+Before we begin the modelling process, we typically examine correlations between our candidate predictors to identify variables that are highly correlated. When then remove highly correlated variables (retaining the best predictor of each correlated pair).
+
+```{r Examine Correlations between Predictors, echo=FALSE}
+
+corr_dat <- 
+  mtl_ufp_dat_clean_std %>%
+  pivot_longer(., cols = contains("300"), names_to = "names", values_to = "values") %>%
+  mutate_at(vars("names"), ~str_remove(., "_300m")) %>%  # we know they are all 300m, so we can remove for clarity when looking at correlations
+  pivot_wider(., names_from = "names", values_from = "values")
+
+corr_matrix <- cor(corr_dat)
+
+corrplot(corr_matrix, addCoef.col = 1,type = "lower",tl.cex = 0.5 ,  number.cex = 0.5) 
+colnames(mtl_ufp_dat_clean_std)
+diag(corr_matrix) <- 0
+
+# this helps to see which pairs of variables have a cor > 0.7
+corr_matrix %>%
+  as.data.frame() %>%
+  mutate_all(., ~. > 0.7) %>%
+  filter_all(., any_vars(. == TRUE)) %>%
+  t() %>%
+  as.data.frame() %>%
+  filter_all(., any_vars(. == TRUE))
+
+```
+
+## Remove Correlated Predictor Variables
+
+We will remove 7 predictor variables that are highly correlated with other variables in the data set.
+
+```{r Remove Correlated Variables, echo = FALSE}
+
+# looking at the corrplot, we can see which pairs of variables have cor > 0.7
+  # for each of those pairs, remove the variables that has the lower correlation with ln_ufp. they are:
+hi_cor_vars <- c("Av_NOx_300m", "Tot_traffic_300m", "Tot_NOx_300m", "Distance_yul", "Distance_npri_nox", "Highways_300m", "Noeuds_300m")
+
+mtl_ufp_dat_clean_std <- 
+  mtl_ufp_dat_clean_std %>%
+  select(-hi_cor_vars)
+
+mtl_ufp_dat_clean <- 
+  mtl_ufp_dat_clean %>%
+  select(-hi_cor_vars)
+
+# verify we no longer have any highly correlated pairs of variables
+mtl_ufp_dat_clean_std %>%
+  cor(.) %>%
+  as.data.frame() %>%
+  mutate_all(., ~. > 0.7)
+
+# we also may need to know what values were used to standardize
+
+# sometimes r sessions in the cloud will crash, it can be helpful to save the compiled files
+saveRDS(mtl_ufp_dat_clean_std, "data/compiled_data/mtl_ufp_dat_clean_std.rds")
+saveRDS(mtl_ufp_dat_clean, "data/compiled_data/mtl_ufp_dat_clean.rds")
+
+```
+
+## MODEL 1: Linear Regression
+
+We will now develop a linear regression model to predict annual UFP variations across Montreal. The code below will generate scatter plots for each predictor variable with our outcome (i.e., ln_ufp).
+
+```{r Relationships between Predictors and the Outcome, echo=FALSE}
+
+
+ufp_untidy <- 
+  mtl_ufp_dat_clean_std %>%
+  pivot_longer(., cols = -ln_ufp, values_to = "Value", names_to = "Variable")
+
+# can also use gather() instead of pivot_longer()
+# ufp_untidy <- gather(mtl_ufp_dat_clean_std, 
+#                       key="Variable",
+#                       value="Value",
+#                       -log_ufp)
+
+ggplot(ufp_untidy, aes(x = Value, y = ln_ufp)) + 
+  facet_wrap(~Variable, scale="free_x") +
+  geom_point(alpha=0.01) +
+  geom_smooth(method="gam", col="blue") +
+  geom_smooth(method="lm",col="red") +
+  theme_classic()
+```
+
+## Using MLR Package for Linear Regression
+
+We will use the ***mlr package*** for several of the following examples. Explanations are provided in the code chunks to describe what is happening at each step. Most of the code included below was modified from examples presented in: <https://www.manning.com/books/machine-learning-with-r-the-tidyverse-and-mlr>.
+
+Admittedly, using the *mlr* package for linear regression is overkill but is included here as a baseline comparison to the other methods we will examine.
+
+The ***mlr*** **package** follows a similar procedure in developing models:
+
+1.  **Define a Method to Impute Missing Data** (we skip this step as it is not relevant in our examples but we include here for completion)
+2.  **Define the "Task" and "Learner"** (e.g., a regression task using a linear regression model)
+3.  **Define and Implement a Method to Automate Feature Selection** or H**yperparameter Tuning** (i.e., select the best set of predictor variables)
+4.  **Evaluate Model Performance through Cross-Validation**
+5.  **Train the Model on all of the Data**
+
+**Define the Imputation Method (You can Skip this This)**
+
+```{r 1. Define the Imputation Method for Missing Data, echo=FALSE}
+
+#Define Imputation Method
+ # impute_method <- imputeLearner("regr.rpart") # This is algorithm used by mlr to impute missing continuous data
+
+#Create new dataset including Imputed data
+# mtl_ufp_dat_clean_Imp <- impute(as.data.frame(mtl_ufp_dat_clean),
+                                 #classes=list(numeric = impute_method))
+
+```
+
+**Define the Task and Learner**
+
+-   In the code below we first define our task using the "**makeRegrTask**" function. This functions takes our dataframe (i.e.,mtl_temp_dat_clean_std) and our target variable name (i.e., ln_ufp) as inputs
+
+-   We use the "**makeLearner**" function to define our "Learner" which in this case is linear regression model (denoted as "regr.lm" in the mlr package.
+
+```{r 2. Define the "Task" and "Learner", echo = FALSE}
+
+#Define the Regression Task and Data to be Used
+mtl_ufp_lm_task <- makeRegrTask(data = as.data.frame(mtl_ufp_dat_clean_std),
+                                 target = "ln_ufp")
+
+#Tell mlr we want to make a linear regression model
+lin <- makeLearner("regr.lm")
+
+```
+
+**Automating Feature Selection using the Filter Method**
+
+In some cases you may know the specific list of variables you want to include in your model, in other cases you may just want to find the best set of possible predictors.
+
+In this example, we will use what *mlr* calls the "filter" method to select predictors. To do this, we first create a ranked list of correlations between our predictor variables and our outcome. Let's look at these correlations.
+
+**Note**: *mlr* offers other methods of variable selection that are more exhaustive but take much longer to run. You can try these on your own.
+
+```{r 3. Automate Feature Selection, echo = FALSE}
+  
+#Generate Correlations bewteen predictors and the outcome
+filter_values <- generateFilterValuesData(mtl_ufp_lm_task,
+                                       method="linear.correlation")
+#List the correlations
+filter_values$data
+ 
+#Plot the correlations 
+plotFilterValues(fvalues = filter_values) + theme_bw() +  coord_flip()
+
+```
+
+We see above that **Tot_NOx_300m** is the most important predictor. This is the average total daily vehicle NOx emissions within 300m. It is not surprising that it is associated with UFP concentrations since both are traffic-related air pollution (i.e. vehicles are an important source of both pollutants).
+
+We would like to consider all 30 of these factors as possible predictors. To do this, we will create what *mlr* calls a "**filter wrapper**" that will determine the best set of predictors of the set of 30 we have identified. This is implemented in the following steps:
+
+1.  We use the "**makeFilterWrapper**" function to create a new learner object (called filter_wrapper) that combines our learner (i.e., a linear regression model) with the method we want to use for variable selection. We specify that we would like to select up to the best 30 variables (fw.abs = 30) based on the linear correlation with the outcome (fw.method = "linear.correlation"). We also specify that we want to force 5 specific variables into the model based on our previous knowledge (latitude, longitude, temperature, humidity, and wind speed) using the "fw.mandatory.feat" option.
+2.  Create the parameter space that will be searched to select variables. Here we specify we are going to search for between 5 and 30 variables. We also define a grid search algorithm which will try every value of our search space (i.e., between 5 and 30 variables.
+3.  Use a cross-validation (CV) procedure to select the best set of variables.
+
+```{r Creating the Filter Wrapper, echo=FALSE}
+# 1. Define the Filter Used to Select Variables
+set.seed(1980)
+filter_wrapper <- makeFilterWrapper(learner = lin, #defined above
+                                   fw.method = "linear.correlation",
+                                   fw.abs = 30, #Include Up to 28 variables
+                                   fw.mandatory.feat = c("lat",#force these in
+                                                         "lon",
+                                                         "temp",
+                                                         "hum",
+                                                         "ws"
+                                                         ))
+# we are forcing in temperature, humidity, and wind speed in order to account for the weather-related temporal variations in UFP concentrations during monitoring. If this was fixed site monitoring with all the measurements occurring at the same time, then would would not need to.
+
+# 2. Define the Parameter Search Space for Selecting Variables 
+lm_param_space <- makeParamSet(
+  makeIntegerParam("fw.abs",
+                   lower=5,   # Minimum number of predictors 
+                   upper=30 ) # Maximum number
+  )
+# Defines the Grid Search 
+grid_search <- makeTuneControlGrid()
+
+
+#3. Applies the Filter Wrapper and Uses CV to select best set of predictors
+kfold10 <- makeResampleDesc("CV",iters=10)
+tuned_features <- tuneParams(
+                         learner = filter_wrapper,
+                         task = mtl_ufp_lm_task,
+                         resampling = kfold10,
+                         par.set = lm_param_space,
+                         control=grid_search,
+                         measures = list(mse, rsq))
+# This will taka about a minute
+
+#View Results
+tuned_features
+```
+
+From the output above you can see that the filter wrapper procedure selected a model including all 30 predictors. We will now evaluate our linear model in a cross-validation (3-fold CV) procedure to estimate how our model will perform in predicting values in external data sets
+
+##### This seems like is it the same as above, but without tunning (ie, selecting \# of variables, just doing all 30) and by doing 3 fold CV instead of 10 fold. I don't see two loops, just one. Maybe I'm missing it.
+
+```{r Evaluate the Linear Model using a Cross-Validation Procedure, echo = FALSE}
+ 
+#Train Model Using CV ----------------------------------------------------
+set.seed(1980)
+
+kfold3 <- makeResampleDesc("CV",iters=3)
+
+# parallelStartSocket(cpus=detectCores())
+
+lm_CV <- resample(filter_wrapper,
+                  mtl_ufp_lm_task,
+                  resampling = kfold3,
+                  models = TRUE, # keeps the models
+                  measures = list(mse, rsq))
+
+# parallelStop()
+
+#Look at Cross Validation Results (mean MSE across Test sets: mse.test.mean)
+lm_CV
+
+# look at individual models in the CV
+summary(getLearnerModel(lm_CV$models[[2]])$learner.model)
+summary(getLearnerModel(lm_CV$models[[1]])$learner.model)
+
+```
+
+Let's examine the relationship between measured and predicted values in the cross-validation procedure. To do this, we first create a data frame including the results of the cross-validation procedure.
+
+```{r Look at Cross Validation Results }
+# 1. Create Dataframe Including Measured and Predicted Values from the Cross Validation
+lm_cv_results <-as.data.frame(lm_CV$pred)
+lm_cv_results$iter <- factor(lm_cv_results$iter) #makes the iter variable a factor (inter refers the CV set and has values 1,2,or 3)
+
+#2. Plot Cross-Validation Data ("response" is the prediction and "truth" is the measurement)
+ggplot(lm_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # inter reflects the folds of the cross validation procedure
+  geom_point(alpha=0.05)+
+  geom_smooth(method = "lm") +
+  theme_classic()
+
+#3. Save the mean MSE on Test Set for linear model (unit is log of temperature)
+#lm_mse_cv_test_mean <-  #from the results of the previous code block, just for reference later.
+```
+
+From the plot above we see a strong linear relationship between measured (i.e., truth) and predicted (i.e. response) values from the linear regression model we trained. However, we see that the model isn't doing as well at lower temperatures.
+
+```{r Look at R2 Values within CV sets, echo = FALSE}
+# the r-squared of each fold
+lm_CV$measures.test
+
+# we can see where the r-squared came from by comparing observed and predictions (ie, truth and response) in the test sets of the 3 folds
+fit_lm_iter_1 <- lm(truth~response, data=lm_cv_results, subset=(iter==1))
+summary(fit_lm_iter_1)
+
+fit_lm_iter_2 <- lm(truth~response, data=lm_cv_results, subset=(iter==2))
+summary(fit_lm_iter_2)
+
+fit_lm_iter_3 <- lm(truth~response, data=lm_cv_results, subset=(iter==3))
+summary(fit_lm_iter_3)
+```
+
+We can see that the linear models does somewhat well with R2 values in the external test set of \~0.40 and slopes near to 1. In other applications, an R2 of 0.40 might be disappointing. It is not so bad for predicting spatial variations in outdoor air pollution, but we could do better. R2 are typically between 0.30 and 0.80.
+
+Finally, we can now train the model on all of the data and examine the results with some diagnostic plots. The code below trains the model only on variables that were selected by our filter process (but in our case this is the entire dataset).
+
+```{r Train the Model Using All the Data, echo = FALSE}
+
+#Defines the task limited to the variables selected above by filter procedure (in our case all of them)
+filtered_task <- filterFeatures(mtl_ufp_lm_task, 
+                                fval=filter_values,
+                                abs = unlist(tuned_features$x))
+
+#Train the model 
+filtered_model <- train(lin, filtered_task)
+```
+
+In *mlr*, you have to call the "**getLearnerModel**" function on the model object to extract the model information. Once you do this you can examine the model.
+
+```{r Look at the Linear Regression model, echo = FALSE}
+
+#Extract model information
+lm_model <- getLearnerModel(filtered_model)
+
+# save the model for future use
+saveRDS(lm_model, "models/lm_model.rds")
+
+#Look at the Model Results and Some Diagnostic Plots
+summary(lm_model)
+plot(lm_model)
+
+cooks.distance(lm_model) %>% as.data.frame() %>%
+  mutate(lm_model$model)
+
+lm_model$model %>%
+  mutate(cooks_distance = cooks.distance(lm_model) %>% as.vector()) %>%
+  arrange(desc(cooks_distance))
+
+```
+
+We can see that the model is having trouble with some of the higher values.
+
+We can also map the model errors to look for potential clustering in model residuals (which we want to avoid).
+
+```{r Map Model Errors,  echo = FALSE}
+
+#Add Residuls from Linear Model to mtl_temp_dat_clean
+mtl_ufp_dat_clean$residuals_lm <- resid(lm_model, type = "response")
+
+ggplot()+
+  geom_sf(data = mtl_sf)+
+  geom_point(data=mtl_ufp_dat_clean, mapping=aes(x=lon, y=lat, color=residuals_lm), 
+             position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
+             ) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red") + # quick way to make a color scale
+  #scale_color_viridis_b() +
+  labs(color="Residuals") +
+  theme_void()
+
+```
+
+We can see the there might be some spatial clustering of errors. We can also see that there are more instances of large under-predictions (red) than over-predictions.
+
+Overall, the linear model is okay (R2 **\~0.45; mse.test.mean = 0.4538)** but we would hope to improve performance and possibly reduce spatial clustering of errors by including non-linear relationships for predictor variables. We will do this using GAMs below.
+
+## MODEL 2: GAMs
+
+Next we will develop a GAM model for the UFP concentration data and see if this method can improve on the linear model by capturing non-linear relationships between our independent variables and our outcome.
+
+One of the predictor variables that is likely to have a non-linear relationship with temperature is time-trend. We will plot this below.
+
+```{r Time-Trend vs. Temperaature, echo=FALSE}
+# names(mtl_temp_dat_clean_std) if you need a reminder on variable names you can run this
+
+ggplot(mtl_ufp_dat_clean_std, 
+       aes(y=ln_ufp, x=Tot_NOx_300m)) +
+  geom_point(alpha=0.01)+
+  geom_smooth(method="gam", )+
+  theme_classic()
+
+```
+
+From the plot above we see that the relationship between Tot_NOx_300m and ln_ufp is not linear. Similar patterns may be present for other variables.
+
+We will now define our GAM model "task" and "learner" similar to what we did above for the linear model.
+
+**Note**: Another very common package for GAMs is the *mgcv* package (<https://cran.r-project.org/web/packages/mgcv/index.html>). We use the *mlr* package here as it allows us to use multiple machine learning approaches within a common framework.The *mlr* package also uses a boosting algorithm (GAMboost, for more infomration run: vignette(package = "mboost", "mboost_tutorial") for GAMs which improves performance.
+
+```{r}
+# GAMS #####
+#1. Define GAM Task 
+gam_task <- makeRegrTask(data=as.data.frame(mtl_ufp_dat_clean_std), # Our data
+                         target="ln_ufp") # The variable we want predict
+
+#2. Define the GAM Learner
+gam <- makeLearner("regr.gamboost") #mlr uses an ensemble gamboost algorithm
+
+```
+
+As we did for the linear model, we will define our filter wrapper for selecting GAM model covariates.
+
+```{r Create Filter Wrapper for GAM Variable Selection, echo = FALSE}
+
+# Define Filter Wrapper to Select Predictor Variables
+filter_wrapper_gam <- makeFilterWrapper(learner = gam, #defined above
+                                        fw.method = "linear.correlation",
+                                        fw.abs = 28, # would like to look at all 30, but there are too many dof and gamboost fails, just take the top 28. You can try with 30 on your own.
+                                        )
+
+gam_param_space <- makeParamSet(
+  makeIntegerParam("fw.abs",
+                   lower=1,   # Minimum number of predictors 
+                   upper=28 ) # Maximum number
+  )
+
+grid_search <- makeTuneControlGrid() 
+
+
+# Create the Filter Wrapper Object that will use a 10-fold CV to select best set of predictors
+kfold10 <- makeResampleDesc("CV",iters=10)
+
+tune_wrapper_gam <- makeTuneWrapper(learner = filter_wrapper_gam,
+                                    resampling = kfold10,
+                                    par.set = gam_param_space,
+                                    control = grid_search)
+
+```
+
+We will now evaluate our GAM model using a cross-validation procedure. We use a holdout procedure for the cross-validation because this is much faster.
+
+```{r GAM Cross-Validation, echo = FALSE}
+
+set.seed(1980)
+holdout <- makeResampleDesc("Holdout") # 2/3 used for training, 1/3 used for test
+
+#parallelStartSocket(cpus=detectCores())
+gam_CV <- resample(tune_wrapper_gam,
+                          gam_task,
+                          models = TRUE,
+                          measures = list(mse, rsq),
+                          resampling = holdout)
+#parallelStop()
+gam_CV
+lm_CV # recall the lm results
+```
+
+As you can see from the GAM CV procedure above, the mse.test.mean is slightly lower than for the linear model. Let's examine the cross-validation results further using a plot.
+
+```{r Look at GAM Cross Validation Results }
+# Create Dataframe Including Measured and Predicted Values from the GAM Model in the Holdout Set
+gam_cv_results <- as.data.frame(gam_CV$pred)
+gam_cv_results$iter <- factor(gam_cv_results$iter)
+
+#Plot Cross-Validation Data ("response" is the prediction and "truth" is the measurement)
+ggplot(gam_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # inter reflects the folds of the cross validation procedure
+  geom_point(alpha=0.05)+
+  geom_smooth(method = "lm") +
+  theme_classic()
+
+
+
+```
+
+Let's look at the relationship between measured and predicted values from the GAM in the holdout set.
+
+```{r Look at R2 Values in the GAM CV holdout set, echo = FALSE}
+fit_gam_iter_1 <- lm(truth~response, data=gam_cv_results, subset=(iter==1))
+summary(fit_gam_iter_1)
+
+```
+
+So, in the GAM holdout set the R2 \~ 0.44 which is a slight improvement over the linear model (0.40).
+
+We can now train our GAM model using all of the data and look at the shape of associations between covariates and the outcome.
+
+```{r Train the Model on all of the Data, echo=FALSE}
+
+#parallelStartSocket(cpus=detectCores())
+
+gam_model_mlr <- train(tune_wrapper_gam,gam_task)
+
+#parallelStop()
+
+#Extract model information
+gam_model <- getLearnerModel(gam_model_mlr,more.unwrap=TRUE)
+
+# save model for future use
+saveRDS(gam_model, "models/gam_model.rds")
+
+#This takes about 2 minutes
+```
+
+```{r Plot the most important predictors in the GAM Model, echo=FALSE}
+par(mfrow = c(1,1))
+plot(gam_model,type="l")
+plot(gam_model$fitted(),resid(gam_model))
+
+```
+
+The plots above demonstrate the non-linear relationships captured for the most important variables in the GAM model. We can also map the residuals from the GAM model.
+
+```{r Map GAM Model Errors}
+
+#Add Residuls from GAM Model to mtl_temp_dat_clean
+mtl_ufp_dat_clean$residuals_gam <- resid(gam_model, type = "response")
+
+resid_map_gam <- 
+  ggplot()+
+  geom_sf(data = mtl_sf)+
+  geom_point(data=mtl_ufp_dat_clean %>%
+               pivot_longer(., cols = c(residuals_lm, residuals_gam)), # we can compare the lm residuals to the gam residuals
+             mapping=aes(x=lon, y=lat, color=value), 
+             position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
+             ) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red") + # quick way to make a color scale
+  #scale_color_viridis_b() +
+  labs(color="Residuals") +
+  theme_void() +
+  facet_grid(~name)
+
+resid_map_gam
+```
+
+##### This gam is much worse that the one in the paper since we can include te(lat, lon, k = 10)
+
+So, in summary the GAM model offers some improvement over the linear model. Next we will examine random forest and XGBoost models to see if we can improve on the GAM using more complex (and less interpretable) machine learning methods.
+
+## MODEL 3: Random Forest
+
+We will now turn to less transparent and interpretable machine learning models starting with a random forest model. As you will see, these methods have several "**hyperparameters**" that need to be "**tuned**" to identify the best predictive model. Otherwise, we will follow a similar set of steps as above in training our random forest model.
+
+```{r 1. Define Random Forest Task and Learner, echo=FALSE}
+#1. Define Random Forest Task 
+forest_task <- makeRegrTask(data=as.data.frame(mtl_ufp_dat_clean_std), # Our data
+                         target="ln_ufp") # The variable we want predict
+
+#2. Define the Random Forest Learner
+forest <- makeLearner("regr.randomForest") 
+```
+
+Next we will setup the code to "tune" the hyperparameters for our random forest model. These hyperparameters include:
+
+1.  "**ntree**": This parameter controls the number of trees to train in the "forest".
+2.  "**mtry**": This parameter controls the number of predictor variables that are randomly selected for each individual tree. Remember, training each tree on a random selection of variables helps to keep the trees uncorrelated (i.e., each tree learns a different thing) and also helps to prevent over-fitting.
+3.  "**nodesize**": This parameter controls the minimum number of data points allowed in a "leaf node".
+4.  "**maxnodes**": This parameter defines the maximum number of nodes in each individual tree.
+
+The code below defines the search space we will use in selecting hyperparameters for our random forest model and creates a new object "**tuned_forest_pars**" that stores information for the best set of parameters.
+
+```{r 2. Hyperparameter Tuning for Random Forest Model, echo = FALSE}
+set.seed(1980)
+
+# You can try different numbers for each of these 
+forest_param_space <- makeParamSet(   
+  makeIntegerParam("ntree", lower = 45, upper = 60), 
+  makeIntegerParam("mtry", lower=5,upper=15),
+  makeIntegerParam("nodesize", lower=1, upper=10),
+  makeIntegerParam("maxnodes", lower=5, upper = 30)
+)
+
+#Search Space (We use Random Search to Save Time)
+rand_search <- makeTuneControlRandom(maxit = 100) #Possibly reduce this to 50 to save time
+kfold10 <- makeResampleDesc("CV",iters=10)
+
+#library(parallel)
+#library(parallelMap)
+#parallelStartSocket(cpus=detectCores())
+
+
+tuned_forest_pars <- tuneParams(learner = forest,
+                                task = forest_task,
+                                resampling = kfold10,
+                                par.set = forest_param_space,
+                                control = rand_search
+                                )
+
+#parallelStop()
+#this takes about 15 minutes
+tuned_forest_pars
+```
+
+From the output above we see that the following hyperparameters were selected: ntree=55, mtry=15, nodesize=2, maxnodes=29. ***Please feel free to modify the numbers specified in the hyperparameter search to see how this impacts model performance*****.**
+
+Let's evaluate the performance of our random forest model (with tuned hyperparameters) using a 3-fold cross-validation procedure.
+
+```{r 3. Cross Validation of Random Forest Model, echo=FALSE}
+
+set.seed(1980)
+
+tuned_forest <- setHyperPars(forest, par.vals = tuned_forest_pars$x) # defines a new learner object with the tuned hyperparameters
+
+
+kfold3 <- makeResampleDesc("CV",iters=3)
+
+
+forest_CV <- resample(tuned_forest,
+                      forest_task,
+                      models = TRUE,
+                      measures = list(mse, rsq),
+                      resampling = kfold3)
+
+forest_CV
+gam_CV
+```
+
+From the results above we see that the mse.test.mean is 0.2108 (rsq.test.mean = 0.56) which is a nice improvement over the GAM model above (mse.test.mean \~ 0.2560, rsq.test.mean = 0.48).
+
+```{r Look at CV Results, echo=FALSE}
+# Create Dataframe Including Measured and Predicted Values from the Random Forest Model in the Holdout Set
+forest_cv_results <-as.data.frame(forest_CV$pred)
+forest_cv_results$iter = factor(forest_cv_results$iter)
+
+#Plot Cross-Validation Data ("response" is the prediction and "truth" is the measurement)
+ggplot(forest_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # inter reflects the folds of the cross validation procedure
+  geom_point(alpha=0.05)+
+  geom_smooth(method = "lm") +
+  theme_classic()
+
+
+```
+
+```{r Look at R2 Values in the CV holdout sets, echo = FALSE}
+forest_CV$measures.test
+
+fit_forest_iter_1 <- lm(truth~response, data=forest_cv_results, subset=(iter==1))
+summary(fit_forest_iter_1)
+
+fit_forest_iter_2 <- lm(truth~response, data=forest_cv_results, subset=(iter==2))
+summary(fit_forest_iter_2)
+
+
+fit_forest_iter_3 <- lm(truth~response, data=forest_cv_results, subset=(iter==3))
+summary(fit_forest_iter_3)
+```
+
+We can now train our random forest model using the "tuned" hyperparameters on the complete dataset.
+
+```{r 3. Train Random Forest Model on all data}
+
+tuned_forest <- setHyperPars(forest, par.vals = tuned_forest_pars$x) # defines a new learner with the tuned hyperparameters
+
+tuned_forest_model <- train(tuned_forest,forest_task)
+
+forest_model_data <- getLearnerModel(tuned_forest_model)
+
+# saveRDS(forest_model_data, "models/forest_model.rds")
+
+```
+
+We can now plot the "Out of Bag Error" for our Random Forest model to make sure we have included enough trees in our model. We want to see that the model errors stabilize (i.e., a flat line) as the number of trees included in the model increases. The "Out of Bag Error" is the mean square error for values not included in the training set (Remember, random forest models use a random sampling procedure on subsets of the data (with replacement) called "bagging" during training). If the line in the plot did not level off we could add more trees to see if this would improve model performance.
+
+```{r Plot "Out of Bag" Error for Random Forest Model, echo=FALSE}
+plot(forest_model_data)
+```
+
+In the plot above we see that the error is starting to reach a plateau suggesting that we may have a sufficient number of trees in the model. In this case you may be more comfortable if you added a higher upper limit to *ntree* in *forest_param_space*.
+
+We can also plot the most important variables in the model using the code below.
+
+```{r Variable importance Random Forest, echo=FALSE}
+ # make dataframe from importance() output
+  feat_imp_forest <- importance(forest_model_data) %>% 
+    data.frame() %>% 
+    mutate(feature = row.names(.)) 
+
+  # plot dataframe
+  ggplot(feat_imp_forest, aes(x = reorder(feature, IncNodePurity), 
+                         y = IncNodePurity)) +
+    geom_bar(stat='identity') +
+    coord_flip() +
+    theme_classic() +
+    labs(
+      x     = "Feature",
+      y     = "Importance",
+      title = "Feature Importance"
+    ) 
+
+```
+
+Notice how *Traffic* was also important for the lm and gam models.
+
+We can now plot the model residuals from our Random Forest model as well.
+
+```{r Map Random Forest Model Errors}
+
+#Add Predictions from Random Forest Model to mtl_temp_dat_clean
+forest_predictions <- as.data.frame(predict(tuned_forest_model,forest_task))
+forest_predictions$forest_residual <- (forest_predictions$truth - forest_predictions$response)
+
+mtl_ufp_dat_clean$residuals_forest <- forest_predictions$forest_residual
+
+resid_map_forest <- 
+  ggplot()+
+  geom_sf(data = mtl_sf)+
+  geom_point(data=mtl_ufp_dat_clean %>%
+               pivot_longer(., cols = c(residuals_lm, residuals_gam, residuals_forest)), # we can compare the lm residuals to the gam residuals
+             mapping=aes(x=lon, y=lat, color=value), 
+             position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
+             ) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red") + # quick way to make a color scale
+  #scale_color_viridis_b() +
+  labs(color="Residuals") +
+  theme_void() +
+  facet_grid(~name)
+
+resid_map_forest
+
+
+
+```
+
+There is probably an improvement in the spatial clustering of residuals (i.e., less spatial clustering of residuals for the random forest model). There is a way to test this using Moran's I, though that is beyond the scope of this exercise.
+
+## MODEL 4: XGBoost
+
+Now we will try XGBoost and compare the results to the models above. Remember, XGBoost works by building a series of models (i.e., trees) with each subsequent model trying to predict the *residuals* (i.e., errors) in the previous ensemble of models.
+
+```{r 1. Define XGBoost Task and Learner, echo=FALSE}
+
+#1. Define XGBoost Task 
+xgb_task <- makeRegrTask(data=as.data.frame(mtl_ufp_dat_clean_std), # Our data
+                         target="ln_ufp") # The variable we want predict
+
+#2. Define the XGBoost Learner
+xgb <- makeLearner("regr.xgboost") 
+
+```
+
+XGBoost has several **hyperparameters** we need to select before we start training:
+
+1.  "**eta**": This is the "learning rate". It takes a value between 0 and 1; this value is multiplied by the model weight of each tree to slow down the learning process to prevent overfitting.
+2.  "**gamma**": This is the minimum amount of splitting by which a node must improve the loss function (in our case the mean square error, mse).
+3.  **"max_depth":** The maximum number of levels deep that each tree can grow.
+4.  "**min_child_weight**": The minimum amount of data required in single node
+5.  "**subsample**": The proportion of the data set to be randomly sampled (without replacement) for each tree. This is done to prevent overfitting (setting this to 1 uses all of the data in the training set)
+6.  "**colsample_bytree**": The proportion of predictor variables sampled for each tree.
+7.  "**nrounds**": The number of sequentially built trees in the model.
+
+```{r 2. Hyperparameter tuning for XGBoost, echo=FALSE}
+set.seed(1980)
+#Define the Paramater Space to Search
+xgb_param_space <- makeParamSet(
+  makeNumericParam("eta",lower=0,upper=1),
+  makeNumericParam("gamma", lower=0, upper=1),
+  makeIntegerParam("max_depth",lower=1,upper=10),
+  makeNumericParam("min_child_weight", lower=1, upper=10),
+  makeNumericParam("colsample_bytree", lower=0.5, upper=1),
+  makeIntegerParam("nrounds", lower=30,upper=30) #Fix this to start, can adjust later if needed
+)
+#Perform a Random Search (100 interations)
+rand_search <- makeTuneControlRandom(maxit = 100)
+
+kfold10 <- makeResampleDesc("CV",iters=10)
+
+tuned_xgb_params <- tuneParams(learner = xgb,
+                               task = xgb_task,
+                               resampling = kfold10,
+                               par.set=xgb_param_space,
+                               control=rand_search)
+#This will take about 10 minutes
+tuned_xgb_params
+
+
+```
+
+We can now evaluate our XGBoost model (with tuned hyperparameters) in a 3-fold cross-validation procedure.
+
+```{r 3. XGBoost Cross Validation, echo = FALSE}
+
+set.seed(1980)
+
+# Defines a new learner object with the tuned hyperparameters
+tuned_xgb <- setHyperPars(xgb, par.vals = tuned_xgb_params$x) 
+
+
+kfold3 <- makeResampleDesc("CV",iters=3)
+
+
+xgb_CV <- resample(tuned_xgb, xgb_task,                       
+                   models = TRUE,
+                   measures = list(mse, rsq),
+                   resampling = kfold3)
+
+xgb_CV
+forest_CV
+```
+
+From the results above, we see that the XGBoost model is performing the best of any of the models examined so far (mse.test.mean = 0.1697, rsq.test.mean = 0.64).
+
+```{r Look at CV Results, echo=FALSE}
+# Create Dataframe Including Measured and Predicted Values from the XGBoost Model in the CV sets
+xgb_cv_results <-as.data.frame(xgb_CV$pred)
+xgb_cv_results$iter = factor(xgb_cv_results$iter)
+
+#Plot Cross-Validation Data ("response" is the prediction and "truth" is the measurement)
+ggplot(xgb_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # inter reflects the folds of the cross validation procedure
+  geom_point(alpha=0.05)+
+  geom_smooth(method = "lm") +
+  theme_classic()
+
+```
+
+Look at model performance in each test set.
+
+```{r Look at R2 Values in the CV holdout sets, echo = FALSE}
+xgb_CV$measures.test
+
+fit_xgb_iter_1 <- lm(truth~response, data=xgb_cv_results, subset=(iter==1))
+summary(fit_xgb_iter_1)
+
+fit_xgb_iter_2 <- lm(truth~response, data=xgb_cv_results, subset=(iter==2))
+summary(fit_xgb_iter_2)
+
+
+fit_xgb_iter_3 <- lm(truth~response, data=xgb_cv_results, subset=(iter==3))
+summary(fit_xgb_iter_3)
+```
+
+We will now train the model on all of the data and verify that we have included a sufficient number of trees in the sequence (labeled "iter" in the plot below) for model errors to stabilize.
+
+```{r Train XGBoost Model and Plot RMSE against "nrounds"}
+
+tuned_xgb <- setHyperPars(xgb, par.vals=tuned_xgb_params$x)
+
+tuned_xgb_model <- train(tuned_xgb, xgb_task)
+
+xgb_model_data <- getLearnerModel(tuned_xgb_model)
+
+# saveRDS(xgb_model_data, "models/xgb_model.rds")
+
+#Plot
+ggplot(xgb_model_data$evaluation_log, aes(iter, train_rmse)) +
+          geom_line() +
+          geom_point() +
+          theme_bw()
+
+```
+
+From the plot above we see that we have included a sufficient number of trees (we could probably reduce the hyperparameter **nrounds** to 25).
+
+We can now map the residuals from the XGBoost model
+
+```{r Map Residuals from XGBoost Model, echo=FALSE}
+#Add Residuls from XGBoostModel to mtl_temp_dat_clean
+xgb_predictions <- as.data.frame(predict(tuned_xgb_model,xgb_task))
+xgb_predictions$xgb_residual <- (xgb_predictions$truth - xgb_predictions$response)
+
+mtl_ufp_dat_clean$residuals_xgb <- xgb_predictions$xgb_residual
+
+resid_map_xgb <- 
+  ggplot()+
+  geom_sf(data = mtl_sf)+
+  geom_point(data=mtl_ufp_dat_clean %>%
+               pivot_longer(., cols = c(residuals_lm, residuals_gam, residuals_forest, residuals_xgb)), # we can compare the lm residuals to the gam residuals
+             mapping=aes(x=lon, y=lat, color=value), 
+             position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
+             ) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red") + # quick way to make a color scale
+  #scale_color_viridis_b() +
+  labs(color="Residuals") +
+  theme_void() +
+  facet_wrap(~name, ncol = 2)
+
+resid_map_xgb
+```
+
+```{r Examine Which Variables were Most Important, echo = FALSE}
+
+# This provides a list of variables and their relative importance in the model
+getFeatureImportance(tuned_xgb_model)
+```
+
+## MODEL 5: Dense Neural Networks
+
+As our final approach, we will examine dense neural networks using the *keras* package in R.
+
+```{r Install Keras, echo = FALSE}
+
+#install.packages("keras")
+#virtualenv_create("r-reticulate", python = install_python())
+
+#library(keras)
+#install_keras(envname = "r-reticulate")
+
+#library(keras)
+#tensorflow::tf_config()
+
+#For Cloud
+install.packages("keras")
+keras::install_keras(tensorflow = "cpu") # say no to miniconda
+library(keras)
+library(tensorflow)
+```
+
+First we will create our training, validation, and test sets. The training data is used for model training (obviously). The validation set is used for hyperparameter tuning (e.g., learning rate, model layers etc.). The test set is used to evaluate the final model.
+
+```{r Create Training, Validation, and Test Sets, echo = FALSE}
+
+#make this example reproducible
+set.seed(2012)
+
+#use 70% of dataset as training set and 30% as validation/test set
+sample <- sample.split(mtl_ufp_dat_clean_std$ln_ufp, SplitRatio = 0.7)
+
+train_dat  <- subset(mtl_ufp_dat_clean_std, sample == TRUE) #Training Set
+val_dat_prelim   <- subset(mtl_ufp_dat_clean_std, sample == FALSE)
+
+sample_2 <- sample.split(val_dat_prelim$ln_ufp, SplitRatio = 0.5)
+
+test_dat <- subset(val_dat_prelim, sample_2 == TRUE) #Validation Set
+val_dat <- subset(val_dat_prelim, sample_2 == FALSE) #Test Set
+```
+
+Next we process the data to be used in our neural network. The code creates matrices (required for *keras*) for our outcome (i.e. target) and training/validation data.
+
+```{r Process Data for use in Neural Network, echo=FALSE}
+train_target <- train_dat$ln_ufp
+
+train_target <-as.matrix(train_target)
+
+train_dat <- train_dat %>%
+  select(-ln_ufp)
+
+train_dat <- as.matrix(train_dat)
+
+
+val_target <- val_dat$ln_ufp
+val_target <- as.matrix(val_target)
+
+
+val_dat <- val_dat %>%
+  select(-ln_ufp)
+
+val_dat <- as.matrix(val_dat)
+
+test_target <- test_dat$ln_ufp
+test_dat <- test_dat %>%
+  select(-ln_ufp)
+
+test_target <- as.matrix(test_target)
+test_dat <- as.matrix(test_dat)
+
+
+```
+
+Now we can build our dense neural network. Dense neural networks are made up of a sequence of data processing layers. In the example below, the model includes two densely connected layers with 32 and 64 units each followed by a dropout layer (this helps with overfitting by "dropping out" (i.e., setting to zero) a portion of the unit outputs during training ). The final layer the provides our prediction.
+
+We will also define "callbacks" which are....
+
+```{r Define the Dense Neural Network, echo=FALSE}
+
+#Please alter the number of layers and the units values (e.g, try 16, 32, 128 etc) to see how it impacts training. 
+nn_model <- keras_model_sequential() %>%
+  layer_dense(units= 32, activation = "relu") %>% 
+  layer_dense(units= 64, activation = "relu") %>%
+  layer_dropout(rate=0.6) %>% # rate refers to the proportion of unit outputs that are zeroed out
+  layer_dense(units = 1, activation = "linear")
+
+#Define Callbacks
+callback_list <- list(
+  # This callback reduces the learning rate if the model isn't improving
+  # Leave this out at first and see what effect this has once you have changed the hyperparamters, model layers, etc.
+  #callback_reduce_lr_on_plateau(monitor = "val_loss", patience = 2,factor=0.1),
+  #This callback saves the best model
+    callback_model_checkpoint(filepath = "nn.models",monitor = "val_loss", save_best_only = TRUE))
+```
+
+```{r Compile and Train Neural network, echo=FALSE}
+
+model <- nn_model %>% 
+  compile(optimizer = optimizer_adam(learning_rate =  0.001), #we use the adam optimizer
+                  loss = "mse", # model is trained to minimize mse
+                  metrics = "mae") %>% # we also monitor mean absolute error
+  fit(train_dat,
+     train_target,
+     validation_data = list(val_dat, val_target),
+     epochs=20, # How many iterations over the data
+     #batch_size = 25, # We wil use this command when working with images
+     verbose=1,
+     callbacks=callback_list)
+
+```
+
+```{r Evaluate Model on Test Set, echo=FALSE}
+#Load the Saved Model 
+nn_model <- load_model_tf("nn.models")
+
+#Generate Predictions in the Test Set
+nn_predictions <- predict(nn_model, test_dat)
+
+#Combine Measured and Predicted Values into a Dataframe
+nn_predictions <- as.data.frame(unlist(nn_predictions))
+nn_predictions <- nn_predictions %>%
+  rename(prediction = V1)
+
+
+
+test_target_df <- as.data.frame(unlist(test_target))
+
+test_target_df <- test_target_df %>%
+  rename(target = V1)
+
+combined <-as.data.frame(c(nn_predictions,test_target_df))
+
+
+ggplot(combined, aes(x=prediction, y=target))+
+  geom_point()+
+  geom_smooth(method="lm") +
+  theme_classic()
+
+```
+
+```{r Get R2 value for Measured vs Predicted in Test Set, echo=FALSE}
+
+fit <- lm(target ~ prediction, data=combined)
+summary(fit)
+
+```
+
+Try adjusting the hyperparameters and see how this impacts model performance. Does the dense neural network seem to perform as well as the methods above?
+
+## 6. Mapping Predicted Temperature Variations
+
+\*Can we map predictions on a typical hot day for a few models?
+
+```{r}
+# load compiled data
+mtl_ufp_dat_clean_std <- readRDS("data/compiled_data/mtl_ufp_dat_clean_std.rds")
+mtl_ufp_dat_clean <- readRDS("data/compiled_data/mtl_ufp_dat_clean.rds")
+
+# load models
+lm_model <- readRDS("models/lm_model.rds")
+gam_model <- readRDS("models/gam_model.rds")
+forest_model <- readRDS("models/forest_model.rds")
+xgb_model <- readRDS("models/xgb_model.rds")
+nn_model <- load_model_tf("nn.models")
+
+# load land use and traffic data for the entire study area (i.e., the surface)
+surface_data <- read_csv("data/surface_data/montreal_fishnet_landuse_05012023.csv") %>%
+  mutate(lon = point_lon, lat = point_lat) %>%
+  mutate(ws = 15.15833, temp = 7.4, hum = 0.6) %>%
+  rename(NPRI_NOx_300m = NPRI_NOx_200m, NPRI_PM_300m = NPRI_PM_200m)
+# we did a bit of trickery when reading this in
+  # first, we created duplicate columns of latitude and longitude. the model is trained on standardized lat+lon, but we would like to keep the originals in order to map them
+  # second the surface data did not have NPRI_NOx or NPRI_PM for the 300m buffers
+    # these are the number of registered NOx and PM emitters within the buffer
+    # what should we do? Probably retrain using the 200m buffers
+    # take a look at them, do you think there is a big difference between the 200m and 300m buffers? What about the 200m and 100m? for the purposes of this exercise, we can just use the 200m buffer values for the 300m buffer
+
+
+
+# model was trained on the std data. we need to standardize the scale the surface data using the same mean and std.
+std_means_df <- map_dbl(mtl_ufp_dat_clean, ~round(mean(., na.rm = T), 5)) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(name = 1, mean = 2)
+
+std_sds_df <- map_dbl(mtl_ufp_dat_clean, ~round(sd(., na.rm = T), 5)) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(name = 1, sd = 2)
+
+scaled_surface_data <- 
+  surface_data %>%
+  select(my_id0, point_lon, point_lat, lon, lat, temp, hum, ws, contains("300"), contains("istance")) %>%
+  pivot_longer(., cols = c(-my_id0:-point_lat)) %>%
+  left_join(., std_means_df) %>%
+  left_join(., std_sds_df) %>%
+  mutate(., scaled_value = (value - mean)/sd) %>%
+  select(-value:-sd) %>%
+  filter(!is.na(scaled_value)) %>%
+  pivot_wider(., names_from = name, values_from = scaled_value)
+
+scaled_surface_data$lm_predictions <- exp(predict(lm_model, scaled_surface_data))
+scaled_surface_data$gam_predictions <- exp(predict(gam_model, scaled_surface_data))
+# scaled_surface_data$forest_predictions <- exp(predict(forest_model, scaled_surface_data))
+# scaled_surface_data$xgb_predictions <- exp(predict(xgb_model, scaled_surface_data))
+
+ggplot(data = scaled_surface_data %>%
+         pivot_longer(., cols = lm_predictions:gam_predictions)) +
+  geom_point(aes(x = point_lon, y = point_lat, color = value)) +
+  theme_void() +
+  scale_fill_distiller(palette = "Spectral") +
+  facet_wrap(~name, ncol = 1) +
+  ggtitle("lm predictions surface")
+
+
+
+predict(lm_model, surface_data %>% rename(lon = point_lon, lat = point_lat, NPRI_PM_300m = NPRI_PM_200m, NPRI_NOx_300m = NPRI_NOx_200m) %>%
+          mutate(temp = 7.4, hum = 0.6, ws = 4.2106472222))
+mtl_wind <- mean(c(16.8,	17.3,	17.4,	16.5,	14.9,	13.8,	13.1,	12.7,	13.8,	14.8,	15.3,	15.5))
+mtl_temp <- 7.4
+mtl_hum <- 0.6
+colnames(surface_data)
+
+```
+
+### Trash code
+
+Try doing GAMs with mgcv
+
+```{r}
+# recall the univariable ones
+plotFilterValues(fvalues = filter_values) + theme_bw() +  coord_flip()
+
+# pull the top 10 (using all burns through too many dofs, top 10 should be fine)
+top_lus <- filter_values$data %>% filter(value >0.2) %>% pull(name)
+
+
+library(mgcv)
+
+# make the formula
+gam_form_luvs <- top_lus[-1:-2] %>% paste0(., collapse = ", k = 3) + s(")
+gam_formula <- 
+  paste0("ln_ufp ~ s(", 
+       gam_form_luvs, ", k = 3)",
+       " + s(temp, k=3) + s(hum, k = 3) + s(ws, k = 3) + te(lat, lon, k = 10)") %>% as.formula()
+
+# randomly select 2/3 for training, don't bother split by geohash
+train_rows <- sample(nrow(mtl_ufp_dat_clean_std), size = 0.667*nrow(mtl_ufp_dat_clean_std), replace = F)
+train_set <- mtl_ufp_dat_clean_std %>% dplyr::slice(train_rows)
+test_set <- mtl_ufp_dat_clean_std %>% dplyr::slice(-train_rows)
+
+# tr
+mgcv_gam_model <- gam(data = train_set, gam_formula, method = "REML")
+
+test_set_with_preds <- 
+  test_set %>% 
+  mutate(mgcv_gam_preds = predict(mgcv_gam_model, newdata = ., ) %>% as.vector())
+
+lm(data = test_set_with_preds, mgcv_gam_preds ~ ln_ufp) %>% summary()
+# r2 is between 0.55 and 0.6 depending on the split, that's similar to the final model in the paper
+(log(1.016) - log(1.034))/log(1.016) *100
+```
