@@ -36,8 +36,6 @@ pacman::p_load(tidyverse,
                dplyr,
                mlr,
                lubridate,
-               # parallel,
-               # parallelMap,
                mboost,
                broom,
                rgdal,
@@ -49,19 +47,7 @@ pacman::p_load(tidyverse,
                randomForest,
                xgboost,
                caTools,
-               #reticulate,
                sf)
-#memory issues with posit? maybe try from here: https://community.rstudio.com/t/solution-for-memory-limit-when-knitting-rmarkdown-in-rstudio-cloud/48372
-# stack_size <- getOption("pandoc.stack.size", default = "512m")
-
-# http://adv-r.had.co.nz/memory.html
-
-# can also find what's taking up memory with profvis package
-# install.packages("profvis")
-# library(profvis)
-# profvis({
-# code... 
-# })
 
 ```
 
@@ -73,7 +59,7 @@ The last line provides a list of names of the variables in our database. We will
 
 ```{r Load Data, echo=FALSE}
 # read in the UFP monitoring data
-mtl_ufp_dat <- read_csv("data/monitoring_data/montreal_2020_annual_with_land_use_28032023.csv")
+mtl_ufp_dat <- read_csv("data/monitoring_data/montreal_2020_annual_with_land_use_sharp2023.csv")
 
 # downloading a map of Montreal from a government website
 # create two temporary files so you don't need to think about where you will save and unzip the map
@@ -140,7 +126,7 @@ ggplot(data = min_days_dat) +
   facet_wrap(~data_set) +
   ggtitle("Number of Monitoring Days Per Route\n")
 rm(min_days_dat)
-# notice I added \n to some of the names. At the "\n" ggplot adds a linebreak. I put them there to give a little bit of spacing below the titles. The proper way to do so would be with "theme(plot.title = ....)", but I find using "\n" useful when doing quick exploratory plots because then I don't have to look up exactly how to move titles around.
+# notice I added \n to some of the titles and names. At the "\n" in ggplot adds a linebreak. I put them there to give a little bit of spacing below the titles. The proper way to do so would be with "theme(plot.title = ....)", but I find using "\n" useful when doing quick exploratory plots because then I don't have to look up exactly how to move titles around.
 
 ```
 
@@ -249,7 +235,7 @@ hi_corr_pairs_names <-
   hi_corr_pairs_mtx %>%
   colnames()
 
-# calculate the associations (r2) between UFP and each of the highly correlated variables. account for meterological conditions by including them in the lm()
+# calculate the associations (r2) between UFP and each of the highly correlated variables. account for meteorological conditions by including them in the lm()
 hi_corr_pairs_r2 <- 
   mtl_ufp_dat_clean_std %>%
   select(ln_ufp, temp, hum, ws, all_of(hi_corr_pairs_names)) %>%
@@ -290,10 +276,13 @@ mtl_ufp_dat_clean_std %>%
   as.data.frame() %>%
   mutate_all(., ~. > 0.7)
 
-# sometimes r sessions in the cloud will crash, it can be helpful to save the compiled files as .rds files (R data files)
+# sometimes r sessions in the cloud will crash, it can be helpful to save the compiled files as .rds files (R data files) so we don't have to re-compile the data
 saveRDS(mtl_ufp_dat_clean_std, "data/compiled_data/mtl_ufp_dat_clean_std.rds")
 saveRDS(mtl_ufp_dat_clean, "data/compiled_data/mtl_ufp_dat_clean.rds")
 
+# we won't use these objects again, so we can remove them
+rm(mtl_ufp_dat)
+rm(corr_dat)
 ```
 
 ## MODEL 1: Linear Regression
@@ -303,7 +292,7 @@ We will now develop a linear regression model to predict variations in annual av
 ```{r Relationships between Predictors and the Outcome, echo=FALSE}
 
 
-ufp_untidy <- 
+mtl_ufp_dat_clean_std_long <- 
   mtl_ufp_dat_clean_std %>%
   pivot_longer(., cols = -ln_ufp, values_to = "Value", names_to = "Variable")
 
@@ -313,12 +302,16 @@ ufp_untidy <-
 #                       value="Value",
 #                       -log_ufp)
 
-ggplot(ufp_untidy, aes(x = Value, y = ln_ufp)) + 
+ggplot(mtl_ufp_dat_clean_std_long, aes(x = Value, y = ln_ufp)) + 
   facet_wrap(~Variable, scale="free_x") +
   geom_point(alpha=0.01) +
   geom_smooth(method="gam", col="blue") +
   geom_smooth(method="lm",col="red") +
   theme_classic()
+# this will give some warning because for some variables you won't be able to fit a the non-linear function (the blue lines)
+
+# we won't use these objects again, so we can remove them
+rm(mtl_ufp_dat_clean_std_long)
 
 ```
 
@@ -378,7 +371,7 @@ In this example, we will use what *mlr* calls the "filter" method to select pred
 
 ```{r 3. Automate Feature Selection, echo = FALSE}
   
-#Generate Correlations bewteen predictors and the outcome
+#Generate Correlations between predictors and the outcome
 filter_values <- generateFilterValuesData(mtl_ufp_lm_task,
                                        method="linear.correlation")
 #List the correlations
@@ -430,7 +423,7 @@ tuned_features <- tuneParams(
                          par.set = lm_param_space,
                          control=grid_search,
                          measures = list(mse, rsq))
-# This will taka about a minute
+# This will take about a minute
 
 #View Results
 tuned_features
@@ -445,15 +438,11 @@ set.seed(1980)
 
 kfold3 <- makeResampleDesc("CV",iters=3)
 
-# parallelStartSocket(cpus=detectCores())
-
 lm_CV <- resample(filter_wrapper,
                   mtl_ufp_lm_task,
                   resampling = kfold3,
                   models = TRUE, # keeps the models
                   measures = list(mse, rsq))
-
-# parallelStop()
 
 #Look at Cross Validation Results (mean MSE across Test sets: mse.test.mean)
 lm_CV
@@ -477,8 +466,6 @@ ggplot(lm_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # int
   geom_smooth(method = "lm") +
   theme_classic()
 
-#3. Save the mean MSE on Test Set for linear model (unit is log of ufp concetration)
-#lm_mse_cv_test_mean <-  #from the results of the previous code block, just for reference later.
 ```
 
 From the plot above we see a linear relationship between measured (i.e., truth) and predicted (i.e. response) values from the linear regression model we trained.
@@ -491,6 +478,8 @@ lm_CV$measures.test
 model_r2_list <- list(lm = NA, gam = NA, forest = NA, xgboost = NA, nn = NA)
 model_r2_list$lm <- mean(lm_CV$measures.test$rsq)
 
+# save the model performance as an .rds file
+saveRDS(model_r2_list, "models/model_r2_list.rds")
 
 # we can see where the r-squared came from by comparing observed and predictions (ie, truth and response) in the test sets of the 3 folds
 fit_lm_iter_1 <- lm(truth~response, data=lm_cv_results, subset=(iter==1))
@@ -503,7 +492,7 @@ fit_lm_iter_3 <- lm(truth~response, data=lm_cv_results, subset=(iter==3))
 summary(fit_lm_iter_3)
 ```
 
-We can see that the linear models has R2 values in the external test sets of \~0.44 and slopes near to 1. In other applications, an R2 of 0.44 might be disappointing. It is not so bad for predicting spatial variations in outdoor UFPs, but we can likely do better. Past studies have reported R2 values between 0.30 and 0.80.
+We can see that the linear models has R2 values in the external test sets of \~0.47 and slopes near to 1. In other applications, an R2 of 0.47 might be disappointing. It is not so bad for predicting spatial variations in outdoor UFPs, but we can likely do better. Past studies have reported R2 values between 0.30 and 0.80.
 
 Finally, we can now train the model on all of the data and examine the results with some diagnostic plots. The code below trains the model only on variables that were selected by our filter process (but in our case this is the entire dataset).
 
@@ -545,7 +534,7 @@ lm_model$model %>%
 
 We can see that the model is having trouble with some of the higher values.
 
-We can also map the model errors to look for potential clustering in model residuals (which we want to avoid).
+We can also map the model errors to look for potential spatial clustering of model residuals (which we want to avoid).
 
 ```{r Map Model Errors,  echo = FALSE}
 
@@ -560,13 +549,12 @@ ggplot()+
              position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
              ) +
   scale_color_gradient2(low = "blue", mid = "white", high = "red") + # quick way to make a color scale
-  #scale_color_viridis_b() +
   labs(color="Residuals") +
   theme_void()
 
 ```
 
-We can see the there might be some spatial clustering of errors. We can also see that there are more instances of large under-predictions (red) than over-predictions.
+We can see the there might be some spatial clustering of model errors. We can also see that there are more instances of large under-predictions (red) than over-predictions.
 
 Overall, the linear model does reasonably well (R2 **\~0.47; mse.test.mean = 0.2324)** but we would hope to improve performance and possibly reduce spatial clustering of errors by including non-linear relationships for predictor variables. We will do this using GAMs below.
 
@@ -641,13 +629,13 @@ We will now evaluate our GAM model using a cross-validation procedure. We use a 
 set.seed(1980)
 holdout <- makeResampleDesc("Holdout") # 2/3 used for training, 1/3 used for test
 
-#parallelStartSocket(cpus=detectCores())
 gam_CV <- resample(tune_wrapper_gam,
                           gam_task,
                           models = TRUE,
                           measures = list(mse, rsq),
                           resampling = holdout)
-#parallelStop()
+# this may take a minute or two to run
+
 gam_CV
 lm_CV # recall the lm results
 ```
@@ -665,8 +653,6 @@ ggplot(gam_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + # in
   geom_smooth(method = "lm") +
   theme_classic()
 
-
-
 ```
 
 Let's look at the relationship between measured and predicted values from the GAM in the holdout set.
@@ -675,8 +661,9 @@ Let's look at the relationship between measured and predicted values from the GA
 fit_gam_iter_1 <- lm(truth~response, data=gam_cv_results, subset=(iter==1))
 summary(fit_gam_iter_1)
 
-# add the r2 to the list
+# add the r2 to the model performance list
 model_r2_list$gam <- summary(fit_gam_iter_1)$r.squared
+saveRDS(model_r2_list, "models/model_r2_list.rds")
 ```
 
 So, in the GAM holdout set the R2 \~ 0.49 which is a slight improvement over the linear model (\~ 0.47).
@@ -685,11 +672,7 @@ We can now train our GAM model using all of the data and look at the shape of as
 
 ```{r Train the Model on all of the Data, echo=FALSE}
 
-#parallelStartSocket(cpus=detectCores())
-
 gam_model_mlr <- mlr::train(tune_wrapper_gam,gam_task)
-
-#parallelStop()
 
 #Extract model information
 gam_model <- getLearnerModel(gam_model_mlr,more.unwrap=TRUE)
@@ -697,8 +680,6 @@ gam_model <- getLearnerModel(gam_model_mlr,more.unwrap=TRUE)
 
 # save model for future use
 saveRDS(gam_model, "models/gam_model.rds")
-
-
 
 ```
 
@@ -726,7 +707,6 @@ resid_map_gam <-
              position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
              ) +
   scale_color_gradient2(low = "blue", mid = "white", high = "red") + # quick way to make a color scale
-  #scale_color_viridis_b() +
   labs(color="Residuals") +
   theme_void() +
   facet_grid(~name)
@@ -774,20 +754,14 @@ forest_param_space <- makeParamSet(
 rand_search <- makeTuneControlRandom(maxit = 100) 
 kfold10 <- makeResampleDesc("CV",iters=10)
 
-#library(parallel)
-#library(parallelMap)
-#parallelStartSocket(cpus=detectCores())
-
-
 tuned_forest_pars <- tuneParams(learner = forest,
                                 task = forest_task,
                                 resampling = kfold10,
                                 par.set = forest_param_space,
                                 control = rand_search
                                 )
+#this can take about 5-10 minutes
 
-#parallelStop()
-#this takes about 25 minutes (feel free to get a coffee)
 tuned_forest_pars
 ```
 
@@ -801,7 +775,6 @@ set.seed(1980)
 
 tuned_forest <- setHyperPars(forest, par.vals = tuned_forest_pars$x) # defines a new learner object with the tuned hyperparameters
 
-
 kfold3 <- makeResampleDesc("CV",iters=3)
 
 
@@ -812,7 +785,7 @@ forest_CV <- resample(tuned_forest,
                       resampling = kfold3)
 
 forest_CV
-gam_CV
+gam_CV # recall GAM performance
 ```
 
 How do the mse.test.mean and rsq.test.mean compare to the GAM model?
@@ -834,15 +807,16 @@ ggplot(forest_cv_results, aes(x=response, y=truth, group=iter, colour=iter)) + #
 ```{r Look at R2 Values in the CV holdout sets, echo = FALSE}
 forest_CV$measures.test
 
-# add the r2 to the list
+# add the r2 to the model performance list
 model_r2_list$forest <- mean(forest_CV$measures.test$rsq)
+saveRDS(model_r2_list, "models/model_r2_list.rds")
 
+# we can look at performance in each of the CV iterations
 fit_forest_iter_1 <- lm(truth~response, data=forest_cv_results, subset=(iter==1))
 summary(fit_forest_iter_1)
 
 fit_forest_iter_2 <- lm(truth~response, data=forest_cv_results, subset=(iter==2))
 summary(fit_forest_iter_2)
-
 
 fit_forest_iter_3 <- lm(truth~response, data=forest_cv_results, subset=(iter==3))
 summary(fit_forest_iter_3)
@@ -899,9 +873,6 @@ We can now plot the model residuals from our Random Forest model as well.
 ```{r Map Random Forest Model Errors}
 
 #Add Predictions from Random Forest Model to mtl_ufp_dat_clean
-# forest_predictions <- as.data.frame(predict(forest_model, forest_task))
-# forest_predictions$forest_residual <- (forest_predictions$truth - forest_predictions$response)
-# above isn't working for some reason
 forest_predictions <- 
   data.frame(response = predict(forest_model, mtl_ufp_dat_clean_std),
               truth = mtl_ufp_dat_clean_std$ln_ufp) %>%
@@ -919,14 +890,11 @@ resid_map_forest <-
              position = position_jitter(w = 0.001, h = 0.001) # add a bit of jitter to the points
              ) +
   scale_color_gradient2(low = "blue", mid = "white", high = "red") + # quick way to make a color scale
-  #scale_color_viridis_b() +
   labs(color="Residuals") +
   theme_void() +
   facet_grid(~name)
 
 resid_map_forest
-
-
 
 ```
 
@@ -937,7 +905,6 @@ There is probably an improvement in the spatial clustering of residuals (i.e., l
 Now we will try XGBoost and compare the results to the models above. Remember, XGBoost works by building a series of models (i.e., trees) with each subsequent model trying to predict the *residuals* (i.e., errors) in the previous ensemble of models.
 
 ```{r 1. Define XGBoost Task and Learner, echo=FALSE}
-mtl_ufp_dat_clean_std <- readRDS("data/compiled_data/mtl_ufp_dat_clean_std.rds")
 
 #1. Define XGBoost Task 
 xgb_task <- makeRegrTask(data=as.data.frame(mtl_ufp_dat_clean_std), # Our data
@@ -960,7 +927,7 @@ XGBoost has several **hyperparameters** we need to select before we start traini
 
 ```{r 2. Hyperparameter tuning for XGBoost, echo=FALSE}
 set.seed(1980)
-#Define the Paramater Space to Search
+#Define the Parameter Space to Search
 xgb_param_space <- makeParamSet(
   makeNumericParam("eta",lower=0,upper=1),
   makeNumericParam("gamma", lower=0, upper=5),
@@ -970,7 +937,7 @@ xgb_param_space <- makeParamSet(
   makeNumericParam("colsample_bytree", lower=0.2, upper=1),
   makeIntegerParam("nrounds", lower=30,upper=30) #Fix this to start, can adjust later if needed
 )
-#Perform a Random Search (100 interations)
+#Perform a Random Search (100 iterations)
 rand_search <- makeTuneControlRandom(maxit = 100)
 
 kfold10 <- makeResampleDesc("CV",iters=10)
@@ -980,9 +947,9 @@ tuned_xgb_params <- tuneParams(learner = xgb,
                                resampling = kfold10,
                                par.set=xgb_param_space,
                                control=rand_search)
-#This will take about 15 minutes
-tuned_xgb_params
 
+# This can take about 5-10 minutes
+tuned_xgb_params
 
 ```
 
@@ -1005,10 +972,10 @@ xgb_CV <- resample(tuned_xgb, xgb_task,
                    resampling = kfold3)
 
 xgb_CV
-forest_CV
+forest_CV # recall random forest model performance
 ```
 
-How do the results from your XGBoost model compare to the models above? (mse.test.mean = ?, rsq.test.mean = ?).
+How do the results from your XGBoost model compare to the other models? (mse.test.mean = ?, rsq.test.mean = ?).
 
 ```{r Look at CV Results, echo=FALSE}
 # Create Dataframe Including Measured and Predicted Values from the XGBoost Model in the CV sets
@@ -1028,8 +995,9 @@ Look at model performance in each test set.
 ```{r Look at R2 Values in the CV holdout sets, echo = FALSE}
 xgb_CV$measures.test
 
-# add the r2 to the list
+# add the r2 to the model performance list
 model_r2_list$xgboost <- mean(xgb_CV$measures.test$rsq)
+saveRDS(model_r2_list, "models/model_r2_list.rds")
 
 fit_xgb_iter_1 <- lm(truth~response, data=xgb_cv_results, subset=(iter==1))
 summary(fit_xgb_iter_1)
@@ -1067,12 +1035,11 @@ From the plot above we see that we have included a sufficient number of trees (w
 We can now map the residuals from the XGBoost model
 
 ```{r Map Residuals from XGBoost Model, echo=FALSE}
-#Add Residuls from XGBoostModel to mtl_ufp_dat_clean
+#Add Residuals from XGBoost Model to mtl_ufp_dat_clean
 xgb_predictions <- data.frame(truth = mtl_ufp_dat_clean_std$ln_ufp,
                               response = predict(xgb_model, as.matrix(mtl_ufp_dat_clean_std)[,-1])) %>%
   mutate(xgb_residual = truth - response)
 
-# xgb_predictions$xgb_residual <- (xgb_predictions$truth - xgb_predictions$response)
 mtl_ufp_dat_clean$residuals_xgb <- xgb_predictions$xgb_residual
 
 resid_map_xgb <- 
@@ -1103,13 +1070,19 @@ getFeatureImportance(xgb_model_mlr)
 
 As our final approach, we will examine dense neural networks using the *keras* package in R.
 
+NOTE: if you are using free or "Plus" Posit Cloud account, then you will not have access to enough memory to install the tensorflow package and train the dense neural network. Here is a post about other users running into that problem:
+https://community.rstudio.com/t/tensorflow-can-not-install-in-rstudio-cloud/129441
+
+However if you have a "Premium" or "Instructor" Posit Cloud account, you can click on the RAM icon in the top right and slide the memory allocated to 2 GB or higher. That will allow you to install tensorflow and train the dense neural network. If you are using R on your local machine, you likely have plenty of RAM and will also be able to install tensorflow and trina the dense neural network.
+
 ```{r Install Keras, echo = FALSE}
 
-#For Cloud
-# install.packages("keras")
-# keras::install_keras(tensorflow = "cpu") # say no to miniconda
+install.packages("keras")
+keras::install_keras(tensorflow = "cpu") # say no to miniconda
 library(keras)
 library(tensorflow)
+library(reticulate)
+
 ```
 
 First we will create our training, validation, and test sets. The training data is used for model training (obviously). The validation set is used for hyperparameter tuning (e.g., learning rate, model layers etc.). The test set is used to evaluate the final model.
@@ -1177,7 +1150,8 @@ We will also define "callbacks" which are....
 ```{r Define the Dense Neural Network, echo=FALSE}
 
 #Please alter the number of layers and the units values (e.g, try 16, 32, 128 etc) to see how it impacts training. 
-nn_model <- keras_model_sequential() %>%
+nn_model <- 
+  keras_model_sequential() %>%
   layer_dense(units= 32, activation = "relu") %>% 
   layer_dense(units= 64, activation = "relu") %>%
   layer_dropout(rate=0.6) %>% # rate refers to the proportion of unit outputs that are zeroed out
@@ -1244,8 +1218,8 @@ summary(fit)
 
 # add the nn r2 to the list
 model_r2_list$nn <- summary(fit)$r.squared
-
 saveRDS(model_r2_list, "models/model_r2_list.rds")
+
 ```
 
 Try adjusting the hyperparameters and see how this impacts model performance. Does the dense neural network seem to perform as well as the methods above?
@@ -1255,9 +1229,9 @@ Try adjusting the hyperparameters and see how this impacts model performance. Do
 Can we map predictions on a typical hot day for a few models?
 
 ```{r}
-# note, if the RAM for your session is running high and your session is crashing, that's because there are a lot of large packages and objects saved. the free limit is 1GB. 
-# to get the RAM down, you can restart your R session (Session > Restart R) and clear your environment (broom icon in environment)
-# if you did so, then we need to reload the packages
+# note, if the RAM for your session is running high and your session is crashing, it's because there are a lot of large packages and objects saved. the max allocated memory for the free and "Plus" Posit Cloud accounts is 1GB. 
+# to free up memory, you can restart your R session (Session > Restart R) and clear your environment (broom icon in environment)
+# if you did so, then we need to reload certain packages
 
 library(tidyverse)
 library(mlr)
@@ -1272,7 +1246,7 @@ mtl_ufp_dat_clean <- readRDS("data/compiled_data/mtl_ufp_dat_clean.rds")
 
 # load land use and traffic data for the entire study area (i.e., the surface)
 surface_data <- 
-  read_csv("data/surface_data/montreal_fishnet_landuse_02022023.csv") %>%
+  read_csv("data/surface_data/montreal_fishnet_landuse_sharp2023.csv") %>%
   filter(!is.na(site_id)) %>%
   mutate(lon = point_lon, lat = point_lat) %>% # create duplicate columns for predictions
   mutate(ws = 2.83, temp = 12.67371, hum = 65) # use the annual average during monitoring
@@ -1368,7 +1342,7 @@ detach("package:keras", unload=TRUE)
 detach("package:tensorflow", unload=TRUE)
 
 library(cowplot)
-#install.packages("magick")
+install.packages("magick")
 library(magick)
 ggdraw_lm <- ggdraw() + draw_image("data/prediction_surfaces/lm_surface.png", scale = 1)
 ggdraw_gam <- ggdraw() + draw_image("data/prediction_surfaces/gam_surface.png", scale = 1)
@@ -1376,7 +1350,13 @@ ggdraw_forest <- ggdraw() + draw_image("data/prediction_surfaces/forest_surface.
 ggdraw_xgboost <- ggdraw() + draw_image("data/prediction_surfaces/xgb_surface.png", scale = 1)
 ggdraw_nn <- ggdraw() + draw_image("data/prediction_surfaces/nn_surface.png", scale = 1)
 
-plot_grid(ggdraw_lm, ggdraw_gam, ggdraw_forest, ggdraw_xgboost, ggdraw_nn, ncol = 3)
+# the free Posit Cloud account might not be able to do this
+plot_grid(ggdraw_lm, 
+          ggdraw_gam, 
+          ggdraw_forest, 
+          ggdraw_xgboost, 
+          # ggdraw_nn, # you can uncomment this line if you were able to train the neural network model
+          ncol = 3)
 ggsave(plot = last_plot(), "data/prediction_surfaces/five_model_surfaces.png", width = 24, height = 16, units = "in")
 ```
 
@@ -1398,44 +1378,6 @@ Share model performance here:
 ```{r}
 
 # recall the list of r2 values to help you fill out the google sheet.
+model_r2_list <- readRDS("models/model_r2_list.rds")
 model_r2_list
-```
-
-```{r}
-
-# a more efficient approach to standardizing the surface data
-# data.table is generally more efficient, but the code can be harder to read
-# thoughts on efficiency:
-  # your time is worth WAY more than the computer's time
-  # your code doesn't need to be optimized (i.e. perfectly efficient), especially if it makes the code harder to read. Harder to read for you tomorrow, for you in one year, or for your colleagues. Optimized code is nice, but if it takes a lot of human time to setup, run, modify, or interpret, then it might not be worth it.
-  # when using this online computing it might be worth having more efficient code because of the 1 GB RAM limit. your local machine will have more than 1 GB, so small gains in efficiency might not be worth it when working locally.
-  # read more: https://csgillespie.github.io/efficientR/
-
-
-library(data.table) 
-library(profvis)  # this visualizes memory usage and time, http://rstudio.github.io/profvis/index.html
-setDT(std_means_df)
-setDT(std_sds_df)
-setDT(surface_data)
-
-# put the code you want to evaluate within the curly brackets
-profvis({
-std_means_sd <- std_means_df[std_sds_df, roll = Inf, on = "name"][-1,.(name = as.factor(name), mean, sd)]
-
-surface_data_dt <- 
-  surface_data %>%
-  select(my_id0, point_lon, point_lat, lon, lat, temp, hum, ws, contains("300"), contains("istance")) %>%
-  as.data.table()
-
-long_surface_data_dt <- 
-  melt(surface_data_dt, id.vars = c("my_id0", "point_lat", "point_lon"),
-     variable.name = "name", value.name = "value")
-
-scaled_long_dt <- std_means_sd[long_surface_data_dt, on = "name"][, .(my_id0, point_lat, point_lon, name, scaled_value = (value - mean) / sd)]
-
-dcast(scaled_long_dt, my_id0 + point_lat + point_lon ~ name, value.var = "scaled_value")
-})
-
-# you could to the same around the creation of scaled_surface_data to compare
-
 ```
